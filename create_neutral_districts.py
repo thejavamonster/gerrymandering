@@ -11,45 +11,32 @@ OUTPUT_CSV = "neutral_district_assignment.csv"
 NUM_DISTRICTS = 28  # Set as needed
 POP_COL = "pop"
 
-
 # --- LOAD SHAPEFILE ---
 gdf = gpd.read_file(SHAPEFILE)
 gdf = gdf.set_index("GEOID20")
 
-# Fix invalid geometries
-invalid_count = (~gdf.is_valid).sum()
-if invalid_count > 0:
-    print(f"Fixing {invalid_count} invalid geometries...")
-    gdf["geometry"] = gdf["geometry"].buffer(0)
-
-# Buffer geometries slightly to ensure robust adjacency
-gdf["geometry"] = gdf["geometry"].buffer(0.0001)
-
-# --- LOAD SHAPEFILE ---
-
-# --- BUILD ROBUST ADJACENCY GRAPH ---
-import networkx as nx
-# --- BUILD ADJACENCY GRAPH (original method) ---
-from gerrychain import Graph
+# --- BUILD ADJACENCY GRAPH ---
 graph = Graph.from_geodataframe(gdf)
-
 for node, row in gdf.iterrows():
     graph.nodes[node]["population"] = row[POP_COL]
 
-# Calculate ideal population per district
-ideal_pop = gdf[POP_COL].sum() / NUM_DISTRICTS
+# --- RECURSIVE TREE PARTITIONING ---
+total_pop = sum(graph.nodes[n]["population"] for n in graph.nodes)
+ideal_pop = total_pop / NUM_DISTRICTS
 
-# Assign districts using recursive_tree_part
+# Use a very tight population deviation (1%)
 assignment = recursive_tree_part(
     graph,
     parts=list(range(NUM_DISTRICTS)),
     pop_col="population",
     pop_target=ideal_pop,
-    epsilon=0.02,  # 2% deviation, adjust as needed
+    epsilon=0.01,  # 1% deviation
     node_repeats=1
 )
 
-# Create assignment DataFrame
+# TODO: VRA/minority opportunity analysis and county split minimization
+
+# --- OUTPUT ASSIGNMENT TO CSV ---
 assignment_df = pd.DataFrame({
     "GEOID20": list(assignment.keys()),
     "district": list(assignment.values())
@@ -95,8 +82,8 @@ district_votes = merged.groupby("district").agg({
 district_votes["dem_share"] = district_votes["pre_20_dem_bid"] / (district_votes["pre_20_dem_bid"] + district_votes["pre_20_rep_tru"])
 district_votes["winner"] = district_votes["dem_share"].apply(lambda x: "Dem" if x > 0.5 else "Rep")
 seat_counts = district_votes["winner"].value_counts()
-
 print(f"\nDistrict seat counts (2020 Pres):\n{seat_counts}")
+
 
 # Statewide Dem share vs seat share
 statewide_dem = merged["pre_20_dem_bid"].sum() / (merged["pre_20_dem_bid"].sum() + merged["pre_20_rep_tru"].sum())
@@ -104,56 +91,41 @@ dem_seat_share = (district_votes["winner"] == "Dem").mean()
 print(f"\nStatewide Dem share: {statewide_dem:.3f}")
 print(f"Democratic seat share: {dem_seat_share:.3f}")
 
-# --- Community: Homogeneity index (variance of racial/ethnic shares within each district) ---
-def homogeneity_index(df, group_col, pop_col, district_col="district"):
-    df = df.copy()
-    df["share"] = df[group_col] / df[pop_col]
-    return df.groupby(district_col)["share"].var().mean()
+# --- Homogeneity index (within-district variance of racial/ethnic shares) ---
+for group in ["pop_white", "pop_black", "pop_hisp"]:
+    merged[f"{group}_share"] = merged[group] / merged["pop"]
+homogeneity = merged.groupby("district").agg({
+    "pop_white_share": "var",
+    "pop_black_share": "var",
+    "pop_hisp_share": "var"
+}).mean(axis=1)
+print("\nMean within-district demographic variance (homogeneity index): {:.4f}".format(homogeneity.mean()))
 
-homog_black = homogeneity_index(merged, "pop_black", "pop", "district")
-homog_hisp = homogeneity_index(merged, "pop_hisp", "pop", "district")
-homog_white = homogeneity_index(merged, "pop_white", "pop", "district")
-print(f"\nHomogeneity index (mean within-district variance):")
-print(f"  Black share: {homog_black:.4f}")
-print(f"  Hispanic share: {homog_hisp:.4f}")
-print(f"  White share: {homog_white:.4f}")
+# --- Efficiency gap ---
+total_votes = merged["pre_20_dem_bid"] + merged["pre_20_rep_tru"]
+merged["dem_margin"] = merged["pre_20_dem_bid"] - merged["pre_20_rep_tru"]
+district_votes["total_votes"] = district_votes["pre_20_dem_bid"] + district_votes["pre_20_rep_tru"]
+district_votes["dem_wasted"] = district_votes.apply(lambda r: r["pre_20_dem_bid"] - r["total_votes"]//2 if r["dem_share"] > 0.5 else r["pre_20_dem_bid"], axis=1)
+district_votes["rep_wasted"] = district_votes.apply(lambda r: r["pre_20_rep_tru"] - r["total_votes"]//2 if r["dem_share"] < 0.5 else r["pre_20_rep_tru"], axis=1)
+egap = (district_votes["rep_wasted"].sum() - district_votes["dem_wasted"].sum()) / district_votes["total_votes"].sum()
+print(f"\nEfficiency gap: {egap:.4f}")
 
-# --- Competitiveness: count of competitive districts (Dem share 45-55%) ---
-competitive = ((district_votes["dem_share"] >= 0.45) & (district_votes["dem_share"] <= 0.55)).sum()
-print(f"\nCompetitive districts (Dem share 45-55%): {competitive} / {NUM_DISTRICTS}")
+# --- Mean–median difference ---
+mean_share = district_votes["dem_share"].mean()
+median_share = district_votes["dem_share"].median()
+mm_diff = mean_share - median_share
+print(f"Mean–median difference: {mm_diff:.4f}")
+
+# --- Competitiveness (districts with 45% < Dem share < 55%) ---
+competitive = ((district_votes["dem_share"] > 0.45) & (district_votes["dem_share"] < 0.55)).sum()
+print(f"Competitive districts (45–55% Dem share): {competitive}")
 
 # --- Compactness (Polsby-Popper) ---
-
-# --- Compactness (Polsby-Popper) ---
-import numpy as np
-import geopandas as gpd
-district_shapes = merged.merge(gdf.reset_index()[["GEOID20", "geometry"]], on="GEOID20")
-# Project to a Florida-appropriate CRS for area/perimeter (EPSG:3086 = NAD83 / Florida GDL Albers)
-district_shapes = district_shapes.set_geometry("geometry").to_crs(epsg=3086)
-district_gdf = district_shapes.dissolve(by="district")
-district_gdf["area"] = district_gdf.geometry.area
-district_gdf["perimeter"] = district_gdf.geometry.length
-district_gdf["polsby_popper"] = 4 * np.pi * district_gdf["area"] / (district_gdf["perimeter"] ** 2)
-
-print("\nLeast compact districts (Polsby-Popper):")
-print(district_gdf["polsby_popper"].sort_values().head(5))
-
-# --- Check for non-contiguous (MultiPolygon) districts ---
-from shapely.geometry import MultiPolygon
-noncontig = district_gdf[district_gdf.geometry.type == "MultiPolygon"]
-if not noncontig.empty:
-    print("\nWARNING: The following districts are not contiguous (contain holes or enclaves):")
-    print(noncontig.index.tolist())
-else:
-
-        print("\nChecking for VTDs with zero or only one neighbor in the adjacency graph...")
-        zero_neighbors = [n for n in graph.nodes if len(list(graph.neighbors(n))) == 0]
-        one_neighbor = [n for n in graph.nodes if len(list(graph.neighbors(n))) == 1]
-        if zero_neighbors:
-            print(f"VTDs with ZERO neighbors (possible islands or geometry errors): {zero_neighbors}")
-        else:
-            print("No VTDs with zero neighbors.")
-        if one_neighbor:
-            print(f"VTDs with only ONE neighbor (possible bridges or slivers): {one_neighbor[:20]} ... (total: {len(one_neighbor)})")
-        else:
-            print("No VTDs with only one neighbor.")
+gdf = gpd.read_file(SHAPEFILE)
+gdf = gdf.merge(assignment_df, on="GEOID20")
+district_shapes = gdf.dissolve(by="district")
+district_shapes = district_shapes.to_crs(epsg=6933)  # Equal-area projection for area/perimeter
+district_shapes["area"] = district_shapes.geometry.area
+district_shapes["perim"] = district_shapes.geometry.length
+district_shapes["polsby_popper"] = 4 * 3.141592653589793 * district_shapes["area"] / (district_shapes["perim"] ** 2)
+print("\nMean Polsby-Popper compactness: {:.4f}".format(district_shapes["polsby_popper"].mean()))
